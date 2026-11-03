@@ -1,6 +1,6 @@
 # Credit Risk Modeling & Loan Risk Segmentation in SAS
 
-**Stack:** Base SAS, SAS/STAT, DATA Step, PROC SQL, PROC SURVEYSELECT, PROC LOGISTIC, PROC SGPLOT, PROC REPORT.
+**Stack:** SAS, DATA, SQL
 
 ## Business problem
 Estimate probability of an applicant being classified as **bad credit**, segment risk, and compare decision thresholds with asymmetric error costs. This is a **portfolio demonstration**, not a production lending decision system.
