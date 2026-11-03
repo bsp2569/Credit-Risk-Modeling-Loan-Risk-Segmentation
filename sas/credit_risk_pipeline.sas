@@ -1,6 +1,9 @@
-/* German Credit Risk | Base SAS + SAS/STAT | Run after download_data.py */
-%let root=/home/your_username/sas_credit_risk; /* EDIT THIS PATH */
+/* German Credit Risk | Base SAS + SAS/STAT | Run after download_data.py   */
+/* SAS OnDemand: upload german_credit.csv to ~/sas_credit_risk/data/       */
+%let root=/home/&sysuserid/sas_credit_risk;
 %let seed=2026;
+
+options dlcreatedir;                       /* create outputs/ if missing */
 libname out "&root./outputs";
 filename source "&root./data/german_credit.csv";
 
@@ -31,16 +34,22 @@ proc sql;
         sum(credit_label not in (1,2)) as invalid_labels
  from work.raw;
 quit;
+
+/* Exact-duplicate check across every source column. row_id is excluded
+   on purpose: it is unique by construction, so deduping on it finds nothing.
+   checking_status--credit_label is a positional range covering all 21
+   source variables (row_id and bad_credit come after it). */
 proc sort data=work.raw out=work.unique nodupkey dupout=out.duplicate_rows;
- by row_id;
+ by checking_status--credit_label;
 run;
+
 data work.model_base;
  set work.unique;
  if cmiss(of checking_status credit_history savings employment)=0
     and nmiss(duration_months,credit_amount,age_years,credit_label)=0
     and duration_months>0 and credit_amount>0 and age_years>=18
     and credit_label in (1,2);
- length duration_band $8 amount_band $8;
+ length duration_band $8 amount_band $9;
  if duration_months<=12 then duration_band='0-12';
  else if duration_months<=24 then duration_band='13-24';
  else duration_band='25+';
@@ -62,7 +71,9 @@ proc sql;
  from work.model_base group by checking_status;
 quit;
 
-/* Reproducible stratified train/test split (70/30). */
+/* Reproducible stratified train/test split (70/30).
+   SURVEYSELECT requires the input sorted by the STRATA variable. */
+proc sort data=work.model_base; by bad_credit; run;
 proc surveyselect data=work.model_base out=work.split
  method=srs samprate=0.70 seed=&seed outall;
  strata bad_credit;
@@ -73,8 +84,8 @@ data work.train work.test;
  else output work.test;
 run;
 
-/* Logistic regression: event='1' explicitly means BAD credit. */
-proc logistic data=work.train descending;
+/* Logistic regression: event='1' explicitly models BAD credit. */
+proc logistic data=work.train;
  class checking_status(ref='A14') credit_history(ref='A32')
        savings(ref='A65') employment(ref='A73')
        housing(ref='A152') / param=ref;
@@ -85,22 +96,23 @@ proc logistic data=work.train descending;
  store out.credit_model;
 run;
 
-/* PROC LOGISTIC SCORE output contains P_1 (bad-credit probability).
-   Review variable names in PROC CONTENTS if SAS version differs. */
+/* SCORE output contains P_1 (bad-credit probability). */
 proc contents data=out.test_scores; run;
 data out.risk_decisions;
  set out.test_scores;
+ length risk_band $6;
  bad_probability=P_1;
  if missing(bad_probability) then delete;
  predicted_bad=(bad_probability>=0.50);
- if bad_probability>=0.60 then risk_band='HIGH  ';
+ if bad_probability>=0.60 then risk_band='HIGH';
  else if bad_probability>=0.30 then risk_band='MEDIUM';
- else risk_band='LOW   ';
+ else risk_band='LOW';
  false_negative=(bad_credit=1 and predicted_bad=0);
  false_positive=(bad_credit=0 and predicted_bad=1);
- /* Dataset cost matrix: FN (bad predicted good)=5, FP=1. */
+ /* UCI cost matrix: FN (bad predicted good)=5, FP=1. */
  misclassification_cost=5*false_negative+false_positive;
 run;
+
 proc sql;
  create table out.model_metrics as
  select count(*) as test_n,
@@ -112,32 +124,53 @@ proc sql;
         sum(misclassification_cost) as total_cost,
         sum(misclassification_cost)/count(*) as cost_per_applicant
  from out.risk_decisions;
+
+ create table out.risk_band_summary as
+ select risk_band, count(*) as applicants,
+        mean(bad_credit) as observed_bad_rate format=percent8.2
+ from out.risk_decisions
+ group by risk_band;
 quit;
-/* Evaluate thresholds under asymmetric cost assumptions. */
+
+/* Threshold grid under asymmetric costs. An integer loop avoids
+   floating-point drift that can silently skip 0.95. */
 data work.threshold_grid;
  set out.risk_decisions;
- do threshold=0.05 to 0.95 by 0.05;
+ do t=1 to 19;
+  threshold=t/20;
   decision_bad=(bad_probability>=threshold);
   cost=5*(bad_credit=1 and decision_bad=0)
        +(bad_credit=0 and decision_bad=1);
   output;
  end;
+ drop t;
 run;
 proc sql;
  create table out.threshold_costs as
  select threshold format=4.2, count(*) as n,
-        sum(cost) as total_cost, mean(cost) as mean_cost
+        sum(cost) as total_cost, mean(cost) as mean_cost format=6.3
  from work.threshold_grid group by threshold order by mean_cost;
 quit;
-/* For ROC-AUC on holdout: use predictions as single predictor in PROC LOGISTIC.
-   AUC is printed in Association of Predicted Probabilities and Observed Responses. */
+
+/* Holdout ROC-AUC: see "c" in Association of Predicted Probabilities
+   and Observed Responses, and the ROC plot. */
 proc logistic data=out.risk_decisions plots(only)=roc;
  model bad_credit(event='1')=bad_probability;
  roc 'Holdout score' pred=bad_probability;
 run;
+
+title 'Observed bad-credit rate by checking-account status';
 proc sgplot data=out.segment_risk;
  vbar checking_status / response=bad_rate datalabel;
  yaxis label='Observed bad-credit rate' valuesformat=percent8.0;
- title 'Observed bad-credit rate by checking-account status';
 run;
-proc report data=out.threshold_costs nowd; title 'Decision threshold cost comparison'; run;
+
+title 'Model metrics at threshold 0.50';
+proc print data=out.model_metrics noobs; run;
+
+title 'Observed bad rate by predicted risk band';
+proc print data=out.risk_band_summary noobs; run;
+
+title 'Decision threshold cost comparison';
+proc report data=out.threshold_costs nowd; run;
+title;
